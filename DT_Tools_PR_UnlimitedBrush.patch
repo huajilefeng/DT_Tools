@@ -1,0 +1,241 @@
+From 88f5355c9734fb8efaa57ae2b55dba8994f575d0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=BD=9A=E5=90=8D?= <noreply@local>
+Date: Wed, 7 Oct 2026 01:17:40 +0800
+Subject: [PATCH] =?UTF-8?q?Add=20UnlimitedBrush:=20=E8=A7=A3=E9=99=A4?=
+ =?UTF-8?q?=E7=94=BB=E7=AC=94=E6=9C=80=E5=A4=A7=E6=95=B0=E9=87=8F=E9=99=90?=
+ =?UTF-8?q?=E5=88=B6=EF=BC=88256=E7=AC=94=E7=94=BB/8000=E7=82=B9/=E5=8D=95?=
+ =?UTF-8?q?=E7=AC=94512=EF=BC=8C=E5=AE=A2=E6=88=B7=E7=AB=AF+=E6=88=BF?=
+ =?UTF-8?q?=E4=B8=BB=E5=8F=8C=E4=BE=A7=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../Experience/UnlimitedBrush/Feature.cs      | 67 +++++++++++++++++++
+ .../Experience/UnlimitedBrush/Logic.cs        | 60 +++++++++++++++++
+ .../Experience/UnlimitedBrush/Patch.Client.cs | 36 ++++++++++
+ .../Experience/UnlimitedBrush/Patch.Host.cs   | 28 ++++++++
+ 4 files changed, 191 insertions(+)
+ create mode 100644 DT_Tools/Patches/Experience/UnlimitedBrush/Feature.cs
+ create mode 100644 DT_Tools/Patches/Experience/UnlimitedBrush/Logic.cs
+ create mode 100644 DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Client.cs
+ create mode 100644 DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Host.cs
+
+diff --git a/DT_Tools/Patches/Experience/UnlimitedBrush/Feature.cs b/DT_Tools/Patches/Experience/UnlimitedBrush/Feature.cs
+new file mode 100644
+index 0000000..c27868a
+--- /dev/null
++++ b/DT_Tools/Patches/Experience/UnlimitedBrush/Feature.cs
+@@ -0,0 +1,67 @@
++using DT_Tools.Core;
++using DT_Tools.Core.Attributes;
++using HarmonyLib;
++
++namespace DT_Tools.Patches.Experience.UnlimitedBrush
++{
++    /// <summary>
++    /// 解除画笔最大数量限制（客户端 + 房主双侧）：
++    /// 原版每层/每玩家画册上限 256 笔画、8000 点、单笔 512 点，超限静默丢弃
++    /// （起笔失败 / 强制收笔 / 擦除片段丢失 / 服务端拒收）。本功能用 Transpiler
++    /// 把预算常量抬到 int.MaxValue，起笔、续点、擦除拆分、服务端画册全部不再有数量上限。
++    ///
++    /// 保留的防滥用闸门（与"数量上限"无关，均为数据合法性/频率控制）：
++    /// - DrawingBook.ValidPoint / ValidWidth（0.1.16b Server.Game/DrawingBook.cs:48/:61）：坐标与宽度合法性；
++    /// - TryReplace 点数增长守卫（:178）：擦除拆分后总点数不允许比原笔画增多（防伪造膨胀）；
++    /// - 发包 64 点/包 + 令牌预算（HostPacketHandler.cs:1030，客户端 64 点批量 flush 与之匹配）；
++    /// - 客户端 64 点批量 flush（DrawingManager.cs:383）：仅网络打包频率，非内容上限。
++    ///
++    /// Transpiler 是装载期 IL 改写、无法按调用门闩：自管 Harmony（存在 SelfHarmony 字段
++    /// 引擎即跳过本命名空间自动挂载，见 FeatureLoader.HasSelfManagedHarmony），
++    /// Enabled 热切换时挂/卸，关闭即全部恢复原版上限。
++    /// </summary>
++    [PatchFeature(
++        "解除画笔最大数量限制：原版每层 256 笔画 / 8000 点、单笔 512 点，超限静默丢弃（起笔失败、强制收笔、擦除片段丢失、服务端拒收）。开启后数量不再受限，客户端与房主双侧生效；数据合法性与发包频率防滥用闸门保持原样。",
++        defaultEnabled: false,
++        side: FeatureSide.Both,
++        Author = "佚名")]
++    public sealed class UnlimitedBrushFeature
++    {
++        /// <summary>存在本字段时引擎跳过本命名空间自动挂载，Transpiler 由本类按 Enabled 自管挂卸。</summary>
++        internal static Harmony SelfHarmony;
++
++        private static bool _patched;
++
++        /// <summary>挂载流程完成后：按当前 Enabled 决定是否挂上 Transpiler。</summary>
++        private static void OnPatched()
++        {
++            SelfHarmony ??= new Harmony("DT_Tools.UnlimitedBrush");
++            if (Engine.Enabled<UnlimitedBrushFeature>())
++                ApplyPatches();
++            else
++                RemovePatches();
++        }
++
++        private static void OnEnabled() => ApplyPatches();
++
++        private static void OnDisabled() => RemovePatches();
++
++        private static void ApplyPatches()
++        {
++            if (_patched) return;
++            SelfHarmony ??= new Harmony("DT_Tools.UnlimitedBrush");
++            SelfHarmony.PatchAll(typeof(UnlimitedBrushClientPatch));
++            SelfHarmony.PatchAll(typeof(UnlimitedBrushHostPatch));
++            _patched = true;
++            Log.Info<UnlimitedBrushFeature>("画笔数量上限已解除（客户端 DrawingManager + 房主 DrawingBook）");
++        }
++
++        private static void RemovePatches()
++        {
++            if (SelfHarmony == null) return;
++            SelfHarmony.UnpatchSelf();
++            _patched = false;
++            Log.Info<UnlimitedBrushFeature>("画笔数量上限已恢复原版");
++        }
++    }
++}
+diff --git a/DT_Tools/Patches/Experience/UnlimitedBrush/Logic.cs b/DT_Tools/Patches/Experience/UnlimitedBrush/Logic.cs
+new file mode 100644
+index 0000000..2587e72
+--- /dev/null
++++ b/DT_Tools/Patches/Experience/UnlimitedBrush/Logic.cs
+@@ -0,0 +1,60 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using global::System.Reflection.Emit;
++using HarmonyLib;
++
++namespace DT_Tools.Patches.Experience.UnlimitedBrush
++{
++    /// <summary>
++    /// Transpiler 辅助逻辑（独立于补丁类，让各补丁点只声明锚点与目标常量）。
++    /// 原理：把预算检查里的上限常量（256 / 512 / 8000）替换为 int.MaxValue，
++    /// 使 "Count &gt;= 上限" / "Count &gt; 上限" 永假，笔画数与点数不再受预算约束。
++    /// 各目标常量在对应方法中恰好出现 1 处（Cecil 静态 dump 已核对，见各补丁点注释），
++    /// 替换后立即自检命中数，失配即 Error 日志（升级后锚点漂移一眼定位）。
++    /// </summary>
++    internal static class UnlimitedBrushLogic
++    {
++        /// <summary>
++        /// 将方法内指定值的 ldc.i4* 常量替换为 int.MaxValue。
++        /// label / anchors 用于失配自诊断。
++        /// </summary>
++        internal static IEnumerable<CodeInstruction> LiftBudget(
++            IEnumerable<CodeInstruction> instructions, string label, string anchors, params int[] values)
++        {
++            var codes = instructions.ToList();
++            int[] hits = new int[values.Length];
++            for (int i = 0; i < codes.Count; i++)
++            {
++                for (int v = 0; v < values.Length; v++)
++                {
++                    if (IsLdcOf(codes[i], values[v]))
++                    {
++                        codes[i].opcode = OpCodes.Ldc_I4;
++                        codes[i].operand = int.MaxValue;
++                        hits[v]++;
++                    }
++                }
++            }
++            for (int v = 0; v < values.Length; v++)
++            {
++                if (hits[v] != 1)
++                    Log.Error<UnlimitedBrushFeature>(
++                        $"{label}: 预算常量 {values[v]} 匹配 {hits[v]}/1 处，ldc 序列 [{DumpLdc(codes)}]（锚点：{anchors}）");
++            }
++            return codes;
++        }
++
++        // Harmony 的 ldc.i4.s operand 运行时装箱为 sbyte（ldc.i4 为 int），两种都必须接——
++        // Cecil 静态 dump 只证明指令存在，不能证明运行时装箱类型
++        private static bool IsLdcOf(CodeInstruction code, int value)
++            => (code.opcode == OpCodes.Ldc_I4_S || code.opcode == OpCodes.Ldc_I4)
++               && (code.operand is int i && i == value || code.operand is sbyte b && b == value);
++
++        // 失配自诊断：dump 方法内全部 ldc.i4*（值+运行时装箱类型），升级后锚点漂移一眼定位
++        private static string DumpLdc(IEnumerable<CodeInstruction> codes)
++            => string.Join(" | ", codes
++                .Where(c => c.opcode.Name.StartsWith("ldc.i4", StringComparison.Ordinal))
++                .Select(c => $"{c.opcode.Name}={c.operand}({c.operand?.GetType().Name ?? "null"})"));
++    }
++}
+diff --git a/DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Client.cs b/DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Client.cs
+new file mode 100644
+index 0000000..cd195dd
+--- /dev/null
++++ b/DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Client.cs
+@@ -0,0 +1,36 @@
++using System.Collections.Generic;
++using HarmonyLib;
++
++namespace DT_Tools.Patches.Experience.UnlimitedBrush
++{
++    /// <summary>
++    /// 客户端侧补丁（DrawingManager，0.1.16b DrawingManager.cs）：
++    /// 三处预算检查逐一抬升到 int.MaxValue。客户端放行后，本地画布可任意起笔、
++    /// 续点、擦除拆分；对应服务端放行见 Patch.Host.cs。
++    /// </summary>
++    [HarmonyPatch]
++    internal static class UnlimitedBrushClientPatch
++    {
++        // 起笔准入预算：本层笔画数 ≥256 或 本层总点数 ≥8000 时拒绝起笔并告警。
++        // 常量已由 Cecil 静态 dump 核对：256 / 8000 各 1 处（0.1.16b DrawingManager.cs:338-342）。
++        [HarmonyPatch(typeof(DrawingManager), nameof(DrawingManager.BeginLocalStroke))]
++        [HarmonyTranspiler]
++        private static IEnumerable<CodeInstruction> LiftBeginLocalStroke(IEnumerable<CodeInstruction> instructions)
++            => UnlimitedBrushLogic.LiftBudget(instructions, "DrawingManager.BeginLocalStroke", "DrawingManager.cs:338", 256, 8000);
++
++        // 单笔点数上限：≥512 时强制收笔、丢弃后续点。
++        // 常量 512 已核对（:374-378）；:383 的 64 点批量 flush 是网络打包频率，不在解除范围，保持原样。
++        [HarmonyPatch(typeof(DrawingManager), nameof(DrawingManager.AddLocalPoint))]
++        [HarmonyTranspiler]
++        private static IEnumerable<CodeInstruction> LiftAddLocalPoint(IEnumerable<CodeInstruction> instructions)
++            => UnlimitedBrushLogic.LiftBudget(instructions, "DrawingManager.AddLocalPoint", "DrawingManager.cs:374", 512);
++
++        // 擦除拆分产物预算：本层已达 256 笔时丢弃拆分出的片段（原笔画已删，擦除等于白擦）。
++        // 常量 256 已核对（:486-490）；:484 的 item.Count &gt;= 2 是片段有效性检查，保持原样。
++        // SplitStroke 为私有方法（0.1.16b DrawingManager.cs:436），nameof 无法跨程序集解析私有成员，用字符串定位。
++        [HarmonyPatch(typeof(DrawingManager), "SplitStroke")]
++        [HarmonyTranspiler]
++        private static IEnumerable<CodeInstruction> LiftSplitStroke(IEnumerable<CodeInstruction> instructions)
++            => UnlimitedBrushLogic.LiftBudget(instructions, "DrawingManager.SplitStroke", "DrawingManager.cs:486", 256);
++    }
++}
+diff --git a/DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Host.cs b/DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Host.cs
+new file mode 100644
+index 0000000..0ae2c53
+--- /dev/null
++++ b/DT_Tools/Patches/Experience/UnlimitedBrush/Patch.Host.cs
+@@ -0,0 +1,28 @@
++using System.Collections.Generic;
++using HarmonyLib;
++
++namespace DT_Tools.Patches.Experience.UnlimitedBrush
++{
++    /// <summary>
++    /// 房主侧补丁（Server.Game.DrawingBook，0.1.16b Server.Game/DrawingBook.cs）：
++    /// 服务端画册三处预算检查逐一抬升。防滥用闸门（坐标/宽度合法性、点数增长守卫、
++    /// HostPacketHandler 的 64 点/包与令牌预算）保持原样，见 Feature.cs 类注释。
++    /// </summary>
++    [HarmonyPatch]
++    internal static class UnlimitedBrushHostPatch
++    {
++        // 服务端收点：新笔画数 ≥256 拒绝起笔；单笔点数 + 本次 >512、或 本玩家总点数 + 本次 >8000 拒绝续点。
++        // 常量已由 Cecil 静态 dump 核对：256 / 512 / 8000 各 1 处（0.1.16b Server.Game/DrawingBook.cs:97-101 / :114-118）。
++        [HarmonyPatch(typeof(Server.Game.DrawingBook), nameof(Server.Game.DrawingBook.TryAppend))]
++        [HarmonyTranspiler]
++        private static IEnumerable<CodeInstruction> LiftTryAppend(IEnumerable<CodeInstruction> instructions)
++            => UnlimitedBrushLogic.LiftBudget(instructions, "DrawingBook.TryAppend", "Server.Game/DrawingBook.cs:97/114", 256, 512, 8000);
++
++        // 服务端擦除拆分替换：拆分后总笔画数 >256 时整体拒绝（拆分等于白擦）。
++        // 常量 256 已核对（:183-186）；:161 的 Points.Count &lt; 2 与 :178 的点数增长守卫保持原样。
++        [HarmonyPatch(typeof(Server.Game.DrawingBook), nameof(Server.Game.DrawingBook.TryReplace))]
++        [HarmonyTranspiler]
++        private static IEnumerable<CodeInstruction> LiftTryReplace(IEnumerable<CodeInstruction> instructions)
++            => UnlimitedBrushLogic.LiftBudget(instructions, "DrawingBook.TryReplace", "Server.Game/DrawingBook.cs:183", 256);
++    }
++}
+-- 
+2.34.1
+
